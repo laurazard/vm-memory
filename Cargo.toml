@@ -18,6 +18,7 @@ backend-mmap = ["dep:libc", "dep:winapi"]
 backend-atomic = ["arc-swap"]
 iommu = ["dep:rangemap"]
 rawfd = ["dep:libc"]
+hvf = ["backend-mmap"]
 xen = ["backend-mmap", "bitflags", "vmm-sys-util"]
 
 [dependencies]
