@@ -28,7 +28,7 @@ use crate::volatile_memory::{VolatileMemory, VolatileSlice};
 // re-export for backward compat, as the trait used to be defined in mmap.rs
 pub use crate::bitmap::NewBitmap;
 
-#[cfg(all(not(any(feature = "xen", feature = "hvf")), target_family = "unix"))]
+#[cfg(all(not(any(feature = "xen", feature = "hvf", feature = "mach")), target_family = "unix"))]
 mod unix;
 
 #[cfg(all(feature = "xen", target_family = "unix"))]
@@ -37,13 +37,19 @@ pub(crate) mod xen;
 #[cfg(all(feature = "hvf", target_os = "macos"))]
 mod hvf;
 
+#[cfg(all(feature = "mach", target_os = "macos"))]
+mod mach;
+
 #[cfg(all(feature = "hvf", target_family = "unix"))]
 pub use hvf::{Error as MmapRegionError, MmapRegion, MmapRegionBuilder};
+
+#[cfg(all(feature = "mach", target_family = "unix"))]
+pub use mach::{Error as MmapRegionError, MmapRegion, MmapRegionBuilder};
 
 #[cfg(target_family = "windows")]
 mod windows;
 
-#[cfg(all(not(any(feature = "xen", feature = "hvf")), target_family = "unix"))]
+#[cfg(all(not(any(feature = "xen", feature = "hvf", feature = "mach")), target_family = "unix"))]
 pub use unix::{Error as MmapRegionError, MmapRegion, MmapRegionBuilder};
 
 #[cfg(all(feature = "xen", target_family = "unix"))]

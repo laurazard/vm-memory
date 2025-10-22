@@ -19,7 +19,7 @@ The detailed design of the `vm-memory` crate can be found [here](DESIGN.md).
 ### Platform Support
 
 - Arch: x86_64, ARM64, RISCV64
-- OS: Linux/Unix/Windows
+- OS: Linux/Unix/Windows/macOS
 
 ### Xen support
 
@@ -47,6 +47,10 @@ It was decided by the `rust-vmm` maintainers to keep the interface simple and
 build the crate for either standard Unix memory mapping or Xen, and not both.
 
 Xen is only supported for Unix platforms.
+
+### macOS support
+
+TBD
 
 ## Usage
 

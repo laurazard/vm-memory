@@ -32,6 +32,9 @@ compile_error!("rawfd feature is not supported on Windows targets!");
 compile_error!("xen feature is not supported on Windows targets!");
 
 #[macro_use]
+extern crate log;
+
+#[macro_use]
 pub mod address;
 pub use address::{Address, AddressValue};
 

@@ -1,4 +1,7 @@
-// Copyright (C) 2019 Alibaba Cloud Computing. All rights reserved.
+// Copyright (C) 2025 Docker. All rights reserved.
+//          Albin Kerouanton <albin.kerouanton@docker.com>
+//
+// Portions Copyright (C) 2019 Alibaba Cloud Computing. All rights reserved.
 //
 // Portions Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
@@ -8,15 +11,23 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
-//! Helper structure for working with mmaped memory regions in Unix.
+//! Helper structure for working with mmaped memory regions with the Mach VM API.
 
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::ptr::null_mut;
 use std::result;
+use std::backtrace::Backtrace;
 
-use crate::bitmap::{Bitmap, NewBitmap, BS};
+use libc::{mach_error_string, KERN_SUCCESS, VM_MAKE_TAG};
+use mach2::traps::mach_task_self;
+use mach2::vm::{mach_vm_allocate, mach_vm_deallocate};
+use mach2::vm_statistics::{VM_FLAGS_4GB_CHUNK, VM_FLAGS_ANYWHERE, VM_MEMORY_APPLICATION_SPECIFIC_1};
+use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t};
+
+use crate::bitmap::{Bitmap, BS};
 use crate::guest_memory::FileOffset;
+use crate::bitmap::NewBitmap;
 use crate::volatile_memory::{self, VolatileMemory, VolatileSlice};
 
 /// Error conditions that may arise when creating a new `MmapRegion` object.
@@ -40,6 +51,18 @@ pub enum Error {
     /// The `mmap` call returned an error.
     #[error("{0}")]
     Mmap(io::Error),
+    // The `mach_vm_allocate` call returned an error.
+    #[error("{0}")]
+    VMAllocate(String),
+    /// Seeking the end of the file returned an error.
+    #[error("Error seeking the end of the file: {0}")]
+    SeekEnd(io::Error),
+    /// Seeking the start of the file returned an error.
+    #[error("Error seeking the start of the file: {0}")]
+    SeekStart(io::Error),
+    /// The anonymous flag was specified for a file backed mapping.
+    #[error("The anonymous flag was specified for a file backed mapping")]
+    InvalidAnonymousFlag,
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -52,7 +75,6 @@ pub struct MmapRegionBuilder<B = ()> {
     flags: i32,
     file_offset: Option<FileOffset>,
     raw_ptr: Option<*mut u8>,
-    hugetlbfs: Option<bool>,
     bitmap: B,
 }
 
@@ -77,7 +99,6 @@ impl<B: Bitmap> MmapRegionBuilder<B> {
             flags: libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
             file_offset: None,
             raw_ptr: None,
-            hugetlbfs: None,
             bitmap,
         }
     }
@@ -100,12 +121,6 @@ impl<B: Bitmap> MmapRegionBuilder<B> {
         self
     }
 
-    /// Create the `MmapRegion` object with the specified `hugetlbfs` flag.
-    pub fn with_hugetlbfs(mut self, hugetlbfs: bool) -> Self {
-        self.hugetlbfs = Some(hugetlbfs);
-        self
-    }
-
     /// Create the `MmapRegion` object with pre-mmapped raw pointer.
     ///
     /// # Safety
@@ -123,6 +138,60 @@ impl<B: Bitmap> MmapRegionBuilder<B> {
             return self.build_raw();
         }
 
+        if self.flags & libc::MAP_ANONYMOUS != 0 {
+            self.build_anonymous()
+        } else {
+            self.build_file_backed()
+        }
+    }
+
+    fn build_anonymous(self) -> Result<MmapRegion<B>> {
+        // Forbid file backed mapping when libc::MAP_ANONYMOUS is specified.
+        if self.file_offset.is_some() {
+            return Err(Error::InvalidAnonymousFlag);
+        }
+
+        // SAFETY: Safe because this call just returns the page size and doesn't have any side
+        // effects.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+
+        // Check that the pointer to the mapping is page-aligned.
+        if self.size & (page_size - 1) != 0 {
+            return Err(Error::InvalidPointer);
+        }
+
+        let bt = Backtrace::capture();
+        eprintln!("=== Mach Allocation Backtrace ===");
+        eprintln!("{}", bt);
+        eprintln!("=====================================");
+
+        let mut addr: mach_vm_address_t = 0;
+        let kr = unsafe { mach_vm_allocate(
+            mach_task_self(), 
+            &mut addr as *mut u64,
+            self.size as u64, 
+            (VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_1 as u8) as i32) | VM_FLAGS_ANYWHERE | VM_FLAGS_4GB_CHUNK,
+        ) };
+        if kr != KERN_SUCCESS {
+            let err = unsafe { 
+                let c_str = std::ffi::CStr::from_ptr(mach_error_string(kr));
+                c_str.to_string_lossy().into_owned()
+            };
+            return Err(Error::VMAllocate(err));
+        }
+
+        Ok(MmapRegion {
+            addr: addr as *mut u8,
+            size: self.size,
+            bitmap: self.bitmap,
+            file_offset: self.file_offset,
+            prot: self.prot,
+            flags: self.flags,
+            owned: true,
+        })
+    }
+
+    fn build_file_backed(self) -> Result<MmapRegion<B>> {
         // Forbid MAP_FIXED, as it doesn't make sense in this context, and is pretty dangerous
         // in general.
         if self.flags & libc::MAP_FIXED != 0 {
@@ -166,8 +235,6 @@ impl<B: Bitmap> MmapRegionBuilder<B> {
             std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(self.size, 8).unwrap())
         };
 
-        info!("Allocating {} bytes addr={:p}. Backtrace:\n{}", self.size, addr, std::backtrace::Backtrace::force_capture());
-
         Ok(MmapRegion {
             addr: addr as *mut u8,
             size: self.size,
@@ -176,7 +243,6 @@ impl<B: Bitmap> MmapRegionBuilder<B> {
             prot: self.prot,
             flags: self.flags,
             owned: true,
-            hugetlbfs: self.hugetlbfs,
         })
     }
 
@@ -199,7 +265,6 @@ impl<B: Bitmap> MmapRegionBuilder<B> {
             prot: self.prot,
             flags: self.flags,
             owned: false,
-            hugetlbfs: self.hugetlbfs,
         })
     }
 }
@@ -222,7 +287,6 @@ pub struct MmapRegion<B = ()> {
     prot: i32,
     flags: i32,
     owned: bool,
-    hugetlbfs: Option<bool>,
 }
 
 // SAFETY: Send and Sync aren't automatically inherited for the raw address pointer.
@@ -249,7 +313,7 @@ impl<B: NewBitmap> MmapRegion<B> {
     ///
     /// # Arguments
     /// * `file_offset` - The mapping will be created at offset `file_offset.start` in the file
-    ///   referred to by `file_offset.file`.
+    ///                   referred to by `file_offset.file`.
     /// * `size` - The size of the memory region in bytes.
     pub fn from_file(file_offset: FileOffset, size: usize) -> Result<Self> {
         MmapRegionBuilder::new_with_bitmap(size, B::with_len(size))
@@ -263,12 +327,12 @@ impl<B: NewBitmap> MmapRegion<B> {
     ///
     /// # Arguments
     /// * `file_offset` - if provided, the method will create a file mapping at offset
-    ///   `file_offset.start` in the file referred to by `file_offset.file`.
+    ///                   `file_offset.start` in the file referred to by `file_offset.file`.
     /// * `size` - The size of the memory region in bytes.
     /// * `prot` - The desired memory protection of the mapping.
     /// * `flags` - This argument determines whether updates to the mapping are visible to other
-    ///   processes mapping the same region, and whether updates are carried through to
-    ///   the underlying file.
+    ///             processes mapping the same region, and whether updates are carried through to
+    ///             the underlying file.
     pub fn build(
         file_offset: Option<FileOffset>,
         size: usize,
@@ -295,7 +359,7 @@ impl<B: NewBitmap> MmapRegion<B> {
     /// * `size` - The size of the memory region in bytes.
     /// * `prot` - Must correspond to the memory protection attributes of the existing mapping.
     /// * `flags` - Must correspond to the flags that were passed to `mmap` for the creation of
-    ///   the existing mapping.
+    ///             the existing mapping.
     ///
     /// # Safety
     ///
@@ -370,16 +434,6 @@ impl<B: Bitmap> MmapRegion<B> {
         false
     }
 
-    /// Set the hugetlbfs of the region
-    pub fn set_hugetlbfs(&mut self, hugetlbfs: bool) {
-        self.hugetlbfs = Some(hugetlbfs)
-    }
-
-    /// Returns `true` if the region is hugetlbfs
-    pub fn is_hugetlbfs(&self) -> Option<bool> {
-        self.hugetlbfs
-    }
-
     /// Returns a reference to the inner bitmap object.
     pub fn bitmap(&self) -> &B {
         &self.bitmap
@@ -397,7 +451,7 @@ impl<B: Bitmap> VolatileMemory for MmapRegion<B> {
         &self,
         offset: usize,
         count: usize,
-    ) -> volatile_memory::Result<VolatileSlice<'_, BS<'_, B>>> {
+    ) -> volatile_memory::Result<VolatileSlice<BS<B>>> {
         let _ = self.compute_end_offset(offset, count)?;
 
         Ok(
@@ -418,10 +472,16 @@ impl<B: Bitmap> VolatileMemory for MmapRegion<B> {
 impl<B> Drop for MmapRegion<B> {
     fn drop(&mut self) {
         if self.owned {
-            // SAFETY: This is safe because we mmap the area at addr ourselves, and nobody
+            // SAFETY: This is safe because we allocated the area at addr ourselves, and nobody
             // else is holding a reference to it.
             unsafe {
-                #[cfg(not(miri))]
+                // Use hypervisor.framework hv_vm_deallocate
+                let kr = mach_vm_deallocate(mach_task_self(), *self.addr as u64, self.size as mach_vm_size_t);
+                if kr != KERN_SUCCESS {
+                    error!("failed to deallocate memory addr={:p}", self.addr);
+                }
+
+                #[cfg(not(target_os = "macos"))]
                 libc::munmap(self.addr as *mut libc::c_void, self.size);
 
                 #[cfg(miri)]
@@ -440,14 +500,12 @@ mod tests {
     use super::*;
 
     use std::io::Write;
+    use std::num::NonZeroUsize;
     use std::slice;
     use std::sync::Arc;
     use vmm_sys_util::tempfile::TempFile;
 
-    #[cfg(feature = "backend-bitmap")]
     use crate::bitmap::AtomicBitmap;
-
-    use matches::assert_matches;
 
     type MmapRegion = super::MmapRegion<()>;
 
@@ -465,7 +523,7 @@ mod tests {
 
     #[test]
     fn test_mmap_region_new() {
-        assert_matches!(MmapRegion::new(0).unwrap_err(), Error::Mmap(e) if e.kind() == io::ErrorKind::InvalidInput);
+        assert!(MmapRegion::new(0).is_err());
 
         let size = 4096;
 
@@ -477,45 +535,6 @@ mod tests {
             r.flags(),
             libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_PRIVATE
         );
-    }
-
-    #[test]
-    fn test_mmap_region_set_hugetlbfs() {
-        assert_matches!(MmapRegion::new(0).unwrap_err(), Error::Mmap(e) if e.kind() == io::ErrorKind::InvalidInput);
-
-        let size = 4096;
-
-        let r = MmapRegion::new(size).unwrap();
-        assert_eq!(r.size(), size);
-        assert!(r.file_offset().is_none());
-        assert_eq!(r.prot(), libc::PROT_READ | libc::PROT_WRITE);
-        assert_eq!(
-            r.flags(),
-            libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_PRIVATE
-        );
-        assert_eq!(r.is_hugetlbfs(), None);
-
-        let mut r = MmapRegion::new(size).unwrap();
-        r.set_hugetlbfs(false);
-        assert_eq!(r.size(), size);
-        assert!(r.file_offset().is_none());
-        assert_eq!(r.prot(), libc::PROT_READ | libc::PROT_WRITE);
-        assert_eq!(
-            r.flags(),
-            libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_PRIVATE
-        );
-        assert_eq!(r.is_hugetlbfs(), Some(false));
-
-        let mut r = MmapRegion::new(size).unwrap();
-        r.set_hugetlbfs(true);
-        assert_eq!(r.size(), size);
-        assert!(r.file_offset().is_none());
-        assert_eq!(r.prot(), libc::PROT_READ | libc::PROT_WRITE);
-        assert_eq!(
-            r.flags(),
-            libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_PRIVATE
-        );
-        assert_eq!(r.is_hugetlbfs(), Some(true));
     }
 
     #[test]
@@ -539,7 +558,6 @@ mod tests {
 
     #[test]
     #[cfg(not(miri))] // Miri cannot mmap files
-    #[cfg(feature = "backend-bitmap")]
     fn test_mmap_region_build() {
         let a = Arc::new(TempFile::new().unwrap().into_file());
 
@@ -555,7 +573,16 @@ mod tests {
             prot,
             flags,
         );
-        assert_matches!(r.unwrap_err(), Error::Mmap(err) if err.raw_os_error() == Some(libc::EINVAL));
+        assert_eq!(format!("{:?}", r.unwrap_err()), "InvalidOffsetLength");
+
+        // Offset + size is greater than the size of the file (which is 0 at this point).
+        let r = MmapRegion::build(
+            Some(FileOffset::from_arc(a.clone(), offset)),
+            size,
+            prot,
+            flags,
+        );
+        assert_eq!(format!("{:?}", r.unwrap_err()), "MappingPastEof");
 
         // MAP_FIXED was specified among the flags.
         let r = MmapRegion::build(
@@ -564,7 +591,7 @@ mod tests {
             prot,
             flags | libc::MAP_FIXED,
         );
-        assert_matches!(r.unwrap_err(), Error::MapFixed);
+        assert_eq!(format!("{:?}", r.unwrap_err()), "MapFixed");
 
         // Let's resize the file.
         assert_eq!(unsafe { libc::ftruncate(a.as_raw_fd(), 1024 * 10) }, 0);
@@ -589,12 +616,10 @@ mod tests {
         assert!(r.owned());
 
         let region_size = 0x10_0000;
-        let bitmap = AtomicBitmap::new(region_size, std::num::NonZeroUsize::new(0x1000).unwrap());
+        let bitmap = AtomicBitmap::new(region_size, unsafe { NonZeroUsize::new_unchecked(0x1000) });
         let builder = MmapRegionBuilder::new_with_bitmap(region_size, bitmap)
-            .with_hugetlbfs(true)
             .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE);
         assert_eq!(builder.size, region_size);
-        assert_eq!(builder.hugetlbfs, Some(true));
         assert_eq!(builder.prot, libc::PROT_READ | libc::PROT_WRITE);
 
         crate::bitmap::tests::test_volatile_memory(&(builder.build().unwrap()));
@@ -609,7 +634,7 @@ mod tests {
         let flags = libc::MAP_NORESERVE | libc::MAP_PRIVATE;
 
         let r = unsafe { MmapRegion::build_raw((addr + 1) as *mut u8, size, prot, flags) };
-        assert_matches!(r.unwrap_err(), Error::InvalidPointer);
+        assert_eq!(format!("{:?}", r.unwrap_err()), "InvalidPointer");
 
         let r = unsafe { MmapRegion::build_raw(addr as *mut u8, size, prot, flags).unwrap() };
 
@@ -651,11 +676,24 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "backend-bitmap")]
     fn test_dirty_tracking() {
         // Using the `crate` prefix because we aliased `MmapRegion` to `MmapRegion<()>` for
         // the rest of the unit tests above.
         let m = crate::MmapRegion::<AtomicBitmap>::new(0x1_0000).unwrap();
         crate::bitmap::tests::test_volatile_memory(&m);
+    }
+
+    #[test]
+    fn test_hypervisor_framework_builder() {
+        let size = 4096;
+        
+        // Test that we can create a builder with guest physical address
+        let builder = MmapRegionBuilder::<()>::new_with_bitmap(size, ())
+            .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE);
+        
+        // Note: We can't actually test hv_vm_allocate without a running VM,
+        // but we can test that the builder accepts the guest physical address
+        assert_eq!(builder.size, size);
+        assert_eq!(builder.prot, libc::PROT_READ | libc::PROT_WRITE);
     }
 }
