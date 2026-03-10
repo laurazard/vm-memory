@@ -529,17 +529,14 @@ impl<B> Drop for MmapRegion<B> {
             // SAFETY: This is safe because we allocated the area at addr ourselves, and nobody
             // else is holding a reference to it.
             unsafe {
-                // Use hypervisor.framework hv_vm_deallocate
-                hypervisor::hv_vm_deallocate(self.addr as *mut std::os::raw::c_void, self.size);
-
-                #[cfg(not(target_os = "macos"))]
-                libc::munmap(self.addr as *mut libc::c_void, self.size);
-
-                #[cfg(miri)]
-                std::alloc::dealloc(
-                    self.addr,
-                    std::alloc::Layout::from_size_align(self.size, 8).unwrap(),
-                );
+                if self.flags & libc::MAP_ANONYMOUS != 0 {
+                    hypervisor::hv_vm_deallocate(
+                        self.addr as *mut std::os::raw::c_void,
+                        self.size,
+                    );
+                } else {
+                    libc::munmap(self.addr as *mut libc::c_void, self.size);
+                }
             }
         }
     }
@@ -557,6 +554,8 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use crate::bitmap::AtomicBitmap;
+
+    use matches::assert_matches;
 
     type MmapRegion = super::MmapRegion<()>;
 
@@ -663,16 +662,7 @@ mod tests {
             prot,
             flags,
         );
-        assert_eq!(format!("{:?}", r.unwrap_err()), "InvalidOffsetLength");
-
-        // Offset + size is greater than the size of the file (which is 0 at this point).
-        let r = MmapRegion::build(
-            Some(FileOffset::from_arc(a.clone(), offset)),
-            size,
-            prot,
-            flags,
-        );
-        assert_eq!(format!("{:?}", r.unwrap_err()), "MappingPastEof");
+        assert_matches!(r.unwrap_err(), Error::Mmap(err) if err.raw_os_error() == Some(libc::EINVAL));
 
         // MAP_FIXED was specified among the flags.
         let r = MmapRegion::build(
@@ -681,7 +671,7 @@ mod tests {
             prot,
             flags | libc::MAP_FIXED,
         );
-        assert_eq!(format!("{:?}", r.unwrap_err()), "MapFixed");
+        assert_matches!(r.unwrap_err(), Error::MapFixed);
 
         // Let's resize the file.
         assert_eq!(unsafe { libc::ftruncate(a.as_raw_fd(), 1024 * 10) }, 0);

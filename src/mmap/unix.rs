@@ -166,8 +166,6 @@ impl<B: Bitmap> MmapRegionBuilder<B> {
             std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(self.size, 8).unwrap())
         };
 
-        info!("Allocating {} bytes addr={:p}. Backtrace:\n{}", self.size, addr, std::backtrace::Backtrace::force_capture());
-
         Ok(MmapRegion {
             addr: addr as *mut u8,
             size: self.size,
