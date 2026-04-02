@@ -28,7 +28,10 @@ use crate::volatile_memory::{VolatileMemory, VolatileSlice};
 // re-export for backward compat, as the trait used to be defined in mmap.rs
 pub use crate::bitmap::NewBitmap;
 
-#[cfg(all(not(any(feature = "xen", feature = "hvf", feature = "mach")), target_family = "unix"))]
+#[cfg(all(
+    not(any(feature = "xen", feature = "hvf", feature = "mach")),
+    target_family = "unix"
+))]
 mod unix;
 
 #[cfg(all(feature = "xen", target_family = "unix"))]
@@ -49,7 +52,10 @@ pub use mach::{Error as MmapRegionError, MmapRegion, MmapRegionBuilder};
 #[cfg(target_family = "windows")]
 mod windows;
 
-#[cfg(all(not(any(feature = "xen", feature = "hvf", feature = "mach")), target_family = "unix"))]
+#[cfg(all(
+    not(any(feature = "xen", feature = "hvf", feature = "mach")),
+    target_family = "unix"
+))]
 pub use unix::{Error as MmapRegionError, MmapRegion, MmapRegionBuilder};
 
 #[cfg(all(feature = "xen", target_family = "unix"))]
@@ -586,10 +592,13 @@ mod tests {
     #[test]
     #[cfg(target_family = "unix")]
     fn test_retrieve_offset_from_fd_backing_memory_region() {
+        // SAFETY: Safe because this call just returns the page size.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+
         let f = TempFile::new().unwrap().into_file();
-        f.set_len(0x1400).unwrap();
-        // Needs to be aligned on 4k, otherwise mmap will fail.
-        let offset = 0x1000;
+        f.set_len(page_size + 0x400).unwrap();
+        // Needs to be page-aligned, otherwise mmap will fail.
+        let offset = page_size;
 
         let start_addr = GuestAddress(0x0);
         let gm = GuestMemoryMmap::from_ranges(&[(start_addr, 0x400)]).unwrap();

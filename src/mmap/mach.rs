@@ -17,12 +17,13 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::ptr::null_mut;
 use std::result;
-use std::backtrace::Backtrace;
 
 use libc::{mach_error_string, KERN_SUCCESS, VM_MAKE_TAG};
 use mach2::traps::mach_task_self;
 use mach2::vm::{mach_vm_allocate, mach_vm_deallocate};
-use mach2::vm_statistics::{VM_FLAGS_4GB_CHUNK, VM_FLAGS_ANYWHERE, VM_MEMORY_APPLICATION_SPECIFIC_1};
+use mach2::vm_statistics::{
+    VM_FLAGS_4GB_CHUNK, VM_FLAGS_ANYWHERE, VM_MEMORY_APPLICATION_SPECIFIC_1,
+};
 use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t};
 
 use crate::bitmap::{Bitmap, NewBitmap, BS};
@@ -152,29 +153,23 @@ impl<B: Bitmap> MmapRegionBuilder<B> {
             return Err(Error::InvalidAnonymousFlag);
         }
 
-        // SAFETY: Safe because this call just returns the page size and doesn't have any side
-        // effects.
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-
-        // Check that the pointer to the mapping is page-aligned.
-        if self.size & (page_size - 1) != 0 {
-            return Err(Error::InvalidPointer);
+        if self.size == 0 {
+            return Err(Error::Mmap(io::Error::from_raw_os_error(libc::EINVAL)));
         }
 
-        let bt = Backtrace::capture();
-        eprintln!("=== Mach Allocation Backtrace ===");
-        eprintln!("{}", bt);
-        eprintln!("=====================================");
-
         let mut addr: mach_vm_address_t = 0;
-        let kr = unsafe { mach_vm_allocate(
-            mach_task_self(), 
-            &mut addr as *mut u64,
-            self.size as u64, 
-            (VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_1 as u8) as i32) | VM_FLAGS_ANYWHERE | VM_FLAGS_4GB_CHUNK,
-        ) };
+        let kr = unsafe {
+            mach_vm_allocate(
+                mach_task_self(),
+                &mut addr as *mut u64,
+                self.size as u64,
+                (VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_1 as u8) as i32)
+                    | VM_FLAGS_ANYWHERE
+                    | VM_FLAGS_4GB_CHUNK,
+            )
+        };
         if kr != KERN_SUCCESS {
-            let err = unsafe { 
+            let err = unsafe {
                 let c_str = std::ffi::CStr::from_ptr(mach_error_string(kr));
                 c_str.to_string_lossy().into_owned()
             };
@@ -466,7 +461,7 @@ impl<B: Bitmap> VolatileMemory for MmapRegion<B> {
         &self,
         offset: usize,
         count: usize,
-    ) -> volatile_memory::Result<VolatileSlice<BS<B>>> {
+    ) -> volatile_memory::Result<VolatileSlice<'_, BS<'_, B>>> {
         let _ = self.compute_end_offset(offset, count)?;
 
         Ok(
@@ -512,6 +507,7 @@ mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
     use super::*;
 
+    use std::io;
     use std::io::Write;
     use std::slice;
     use std::sync::Arc;
@@ -537,11 +533,14 @@ mod tests {
 
     #[test]
     fn test_mmap_region_new() {
-        assert!(MmapRegion::new(0).is_err());
+        assert_matches!(
+            MmapRegion::new(0).unwrap_err(),
+            Error::Mmap(e) if e.kind() == io::ErrorKind::InvalidInput
+        );
 
         let size = 4096;
 
-        let r = MmapRegion::new(4096).unwrap();
+        let r = MmapRegion::new(size).unwrap();
         assert_eq!(r.size(), size);
         assert!(r.file_offset().is_none());
         assert_eq!(r.prot(), libc::PROT_READ | libc::PROT_WRITE);
@@ -553,9 +552,21 @@ mod tests {
 
     #[test]
     fn test_mmap_region_set_hugetlbfs() {
+        assert_matches!(
+            MmapRegion::new(0).unwrap_err(),
+            Error::Mmap(e) if e.kind() == io::ErrorKind::InvalidInput
+        );
+
         let size = 4096;
 
         let r = MmapRegion::new(size).unwrap();
+        assert_eq!(r.size(), size);
+        assert!(r.file_offset().is_none());
+        assert_eq!(r.prot(), libc::PROT_READ | libc::PROT_WRITE);
+        assert_eq!(
+            r.flags(),
+            libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_PRIVATE
+        );
         assert_eq!(r.is_hugetlbfs(), None);
 
         let mut r = MmapRegion::new(size).unwrap();
@@ -588,12 +599,15 @@ mod tests {
 
     #[test]
     #[cfg(not(miri))] // Miri cannot mmap files
+    #[cfg(feature = "backend-bitmap")]
     fn test_mmap_region_build() {
         let a = Arc::new(TempFile::new().unwrap().into_file());
 
+        let page_size =
+            unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         let prot = libc::PROT_READ | libc::PROT_WRITE;
         let flags = libc::MAP_NORESERVE | libc::MAP_PRIVATE;
-        let offset = 4096;
+        let offset = page_size as u64;
         let size = 1000;
 
         // Offset + size will overflow.
@@ -615,7 +629,10 @@ mod tests {
         assert_matches!(r.unwrap_err(), Error::MapFixed);
 
         // Let's resize the file.
-        assert_eq!(unsafe { libc::ftruncate(a.as_raw_fd(), 1024 * 10) }, 0);
+        assert_eq!(
+            unsafe { libc::ftruncate(a.as_raw_fd(), 4 * page_size as i64) },
+            0
+        );
 
         // The offset is not properly aligned.
         let r = MmapRegion::build(
@@ -637,8 +654,7 @@ mod tests {
         assert!(r.owned());
 
         let region_size = 0x10_0000;
-        let bitmap =
-            AtomicBitmap::new(region_size, std::num::NonZeroUsize::new(0x1000).unwrap());
+        let bitmap = AtomicBitmap::new(region_size, std::num::NonZeroUsize::new(0x1000).unwrap());
         let builder = MmapRegionBuilder::new_with_bitmap(region_size, bitmap)
             .with_hugetlbfs(true)
             .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE);
@@ -671,24 +687,38 @@ mod tests {
     #[test]
     #[cfg(not(miri))] // Miri cannot mmap files
     fn test_mmap_region_fds_overlap() {
-        let a = Arc::new(TempFile::new().unwrap().into_file());
-        assert_eq!(unsafe { libc::ftruncate(a.as_raw_fd(), 1024 * 10) }, 0);
+        let page_size =
+            unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
 
-        let r1 = MmapRegion::from_file(FileOffset::from_arc(a.clone(), 0), 4096).unwrap();
-        let r2 = MmapRegion::from_file(FileOffset::from_arc(a.clone(), 4096), 4096).unwrap();
+        let a = Arc::new(TempFile::new().unwrap().into_file());
+        assert_eq!(
+            unsafe { libc::ftruncate(a.as_raw_fd(), 4 * page_size as i64) },
+            0
+        );
+
+        let r1 =
+            MmapRegion::from_file(FileOffset::from_arc(a.clone(), 0), page_size).unwrap();
+        let r2 = MmapRegion::from_file(
+            FileOffset::from_arc(a.clone(), page_size as u64),
+            page_size,
+        )
+        .unwrap();
         assert!(!r1.fds_overlap(&r2));
 
-        let r1 = MmapRegion::from_file(FileOffset::from_arc(a.clone(), 0), 5000).unwrap();
+        let r1 = MmapRegion::from_file(
+            FileOffset::from_arc(a.clone(), 0),
+            page_size + 1000,
+        )
+        .unwrap();
         assert!(r1.fds_overlap(&r2));
 
         let r2 = MmapRegion::from_file(FileOffset::from_arc(a, 0), 1000).unwrap();
         assert!(r1.fds_overlap(&r2));
 
-        // Different files, so there's not overlap.
+        // Different files, so there's no overlap.
         let new_file = TempFile::new().unwrap().into_file();
-        // Resize before mapping.
         assert_eq!(
-            unsafe { libc::ftruncate(new_file.as_raw_fd(), 1024 * 10) },
+            unsafe { libc::ftruncate(new_file.as_raw_fd(), 4 * page_size as i64) },
             0
         );
         let r2 = MmapRegion::from_file(FileOffset::new(new_file, 0), 5000).unwrap();
